@@ -1,14 +1,13 @@
 import { WebSocketProvider, Contract } from "ethers";
+import abi from "./abi/abi.json";
 
 const messageQueue: any[] = [];
 let isProcessingQueue = false;
 
 const provider = new WebSocketProvider("wss:");
 
-const contractAddress = "";
-const contractAbi = [
-  ""
-];
+const contractAddress = "0x8eB698d3CF420916CeeA996cB1Ef8443EE8935D2";
+const contractAbi = abi.abi;
 
 const contract = new Contract(contractAddress, contractAbi, provider);
 
