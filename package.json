@@ -1,0 +1,29 @@
+{
+  "name": "monallo-bridge-middleware",
+  "version": "1.0.0",
+  "description": "Monallo Bridge Middleware, listenning the chain data and interface working, transfer assets from chainA to chainB",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "ts-node-dev src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.0.0",
+    "ethers": "^6.14.4",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^24.0.8",
+    "jest": "^30.0.3",
+    "ts-jest": "^29.4.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.8.3"
+  }
+}
