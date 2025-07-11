@@ -4,7 +4,7 @@ import LockTokensAbi from './abi/LockTokens.json';
 import MintTokensAbi from './abi/MintTokens.json';
 import { connectDB } from './db';
 import LockModel from './model/lock';
-import { broadcastToClients } from './WebSocket/websocket';
+import { sendToUser } from './WebSocket/websocket';
 
 dotenv.config();
 
@@ -90,7 +90,7 @@ export async function startListening() {
                         sourceFromTxHash: txHash,
                         targetToTxHash: tx.hash
                     });
-                    broadcastToClients({
+                    sendToUser(receiver,{
                         type: 'MINT_SUCCESS',
                         data: {
                             targetToTxHash: tx.hash
