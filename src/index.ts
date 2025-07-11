@@ -4,6 +4,7 @@ import LockTokensAbi from './abi/LockTokens.json';
 import MintTokensAbi from './abi/MintTokens.json';
 import { connectDB } from './db';
 import LockModel from './model/lock';
+import { broadcastToClients } from './WebSocket/websocket';
 
 dotenv.config();
 
@@ -89,6 +90,12 @@ export async function startListening() {
                         sourceFromTxHash: txHash,
                         targetToTxHash: tx.hash
                     });
+                    broadcastToClients({
+                        type: 'MINT_SUCCESS',
+                        data: {
+                            targetToTxHash: tx.hash
+                        }
+                        });
 
                     if (existingRecord) {
                         existingRecord.status = 'minted';
