@@ -21,7 +21,7 @@ if (!LOCK_CONTRACT_ADDRESS || !MINT_CONTRACT_ADDRESS || !PRIVATE_KEY || !IMUA_RP
 }
 
 // ✅ A链 Provider 和合约（HTTP）
-const aProvider = new ethers.JsonRpcProvider(IMUA_RPC_URL);
+const aProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
 const lockContract = new ethers.Contract(
     LOCK_CONTRACT_ADDRESS,
     LockTokensAbi.abi,
@@ -29,7 +29,7 @@ const lockContract = new ethers.Contract(
 );
 
 // ✅ B链 Provider（WebSocket）和合约
-const bProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
+const bProvider = new ethers.JsonRpcProvider(IMUA_RPC_URL);
 const bWallet = new ethers.Wallet(PRIVATE_KEY, bProvider);
 const mintContract = new ethers.Contract(
     MINT_CONTRACT_ADDRESS,
