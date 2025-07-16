@@ -21,7 +21,7 @@ export interface ICrossBridgeRecord extends Document {
   targetToTokenContractAddress: string;
   targetToReceiveAmount: string;
   targetToCallContractAddress: string;
-  targetToGasStatus: string;
+  targetToGas: string;
   targetToTxHash: string;
   targetToTxStatus: 'pending' | 'failed' | 'success';
 

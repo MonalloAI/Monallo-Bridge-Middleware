@@ -1,5 +1,5 @@
 import mongoose, { Schema } from 'mongoose';
-import { ICrossBridgeRecord } from './CrossBridgeRecord.interface';
+import { ICrossBridgeRecord } from './interface/CrossBridgeRecord.interface';
 
 const CrossBridgeRecordSchema = new Schema<ICrossBridgeRecord>(
   {
@@ -27,7 +27,7 @@ const CrossBridgeRecordSchema = new Schema<ICrossBridgeRecord>(
     targetToTokenContractAddress: { type: String, required: true },
     targetToReceiveAmount: { type: String, required: true },
     targetToCallContractAddress: { type: String, required: true },
-    targetToGasStatus: { type: String, required: true },
+    targetToGas: { type: String, required: true },
     targetToTxHash: { type: String, required: true },
     targetToTxStatus: {
       type: String,
