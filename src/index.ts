@@ -3,7 +3,7 @@ import * as dotenv from 'dotenv';
 import LockTokensAbi from './abi/LockTokens.json';
 import MintTokensAbi from './abi/MintTokens.json';
 import { connectDB } from './db';
-import LockModel from './model/CrossBridgeRecord.model';
+import CrossBridgeRecord from './model/CrossBridgeRecord.model';
 import { sendToUser } from './WebSocket/websocket';
 import ws from 'ws';
 
@@ -63,23 +63,24 @@ export async function startListening() {
                 return;
             }
 
-        
-            await LockModel.updateOne(
+            // 更新前先查找记录
+            const before = await CrossBridgeRecord.findOne({ sourceFromTxHash: txHash });
+            console.log('更新前查到的记录:', before);
+
+            await CrossBridgeRecord.updateOne(
                 { sourceFromTxHash: txHash },
                 {
                     $set: {
-                        fromAddress: sender,
-                        toAddress: receiver,
-                        amount: ethers.formatEther(amount),
-                        fee: fee?.toString(),
                         sourceFromTxStatus: 'success',
-                        timestamp: new Date()
                     }
-                },
-                { upsert: true }
+                }
             );
+    
 
-            const existingRecord = await LockModel.findOne({ sourceFromTxHash: txHash });
+            const after = await CrossBridgeRecord.findOne({ sourceFromTxHash: txHash });
+            console.log('更新后查到的记录:', after);
+
+            const existingRecord = await CrossBridgeRecord.findOne({ sourceFromTxHash: txHash });
 
             if (existingRecord?.crossBridgeStatus === 'minted') {
                 console.log('⏭️ 事件已处理，跳过:', txHash);
@@ -97,6 +98,45 @@ export async function startListening() {
                 data: { targetToTxHash: tx.hash }
             });
 
+           
+            const maxRetry = 3;
+            let retry = 0;
+            let updated = false;
+            while (retry < maxRetry && !updated) {
+                await new Promise(res => setTimeout(res, 2000));
+                const record = await CrossBridgeRecord.findOne({ sourceFromTxHash: txHash });
+                if (record) {
+                    await CrossBridgeRecord.updateOne(
+                        { sourceFromTxHash: txHash },
+                        { $set: { sourceFromTxStatus: 'success' } }
+                    );
+                    console.log(`✅ 第${retry + 1}次重试后，成功更新 sourceFromTxStatus 为 success`);
+                    updated = true;
+                } else {
+                    console.log(`⏳ 第${retry + 1}次重试，仍未查到记录，txHash: ${txHash}`);
+                    retry++;
+                }
+            }
+            if (!updated) {
+                console.warn('⚠️ 多次重试后仍未查到记录，未能更新状态:', txHash);
+            }
+
+  
+            if (updated) {
+
+                const finalRecord = await CrossBridgeRecord.findOne({ sourceFromTxHash: txHash });
+                const isSourceSuccess = finalRecord?.sourceFromTxStatus === 'success';
+                const isTargetSuccess = finalRecord?.targetToTxStatus === 'success' || true; 
+
+                if (isSourceSuccess && isTargetSuccess) {
+                    await CrossBridgeRecord.updateOne(
+                        { sourceFromTxHash: txHash },
+                        { $set: { crossBridgeStatus: 'minted' } }
+                    );
+                    console.log('🎉 crossBridgeStatus 已更新为 minted');
+                }
+            }
+
             const updateData: any = {
                 targetToTxHash: tx.hash,
                 targetToTxStatus: 'success',
@@ -109,10 +149,10 @@ export async function startListening() {
                 updateData.crossBridgeStatus = 'minted';
             }
 
-            await LockModel.updateOne(
+            await CrossBridgeRecord.updateOne(
                 { sourceFromTxHash: txHash },
                 { $set: updateData },
-                { upsert: true }
+         
             );
 
             console.log('🎉 铸币成功:', {
