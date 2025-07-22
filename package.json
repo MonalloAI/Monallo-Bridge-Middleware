@@ -7,7 +7,9 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "ts-node-dev src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "check-queue": "ts-node src/utils/manualQueueCheck.ts",
+    "test-queue": "ts-node src/utils/testQueueChecker.ts"
   },
   "keywords": [],
   "author": "",
