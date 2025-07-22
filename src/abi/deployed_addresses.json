@@ -1,0 +1,15 @@
+{
+  "platon": {
+    "source": "0x59def95E745b5F87146021FB2D3D6C857667F519"
+  },
+  "sepolia": {
+    "source": "0x9c0723d6Dd1362FA48D2f6935D0867B729931622"
+  },
+  "imua": {
+    "targets": {
+      "target_210425": "0x75891AA11AC45ab150e81AE744728d11C72c472B",
+      "target_11155111": "0x1870f6D7A02994EE08E7c9BC3aEad81f00de1A05",
+      "target_7001": "0xD34F03fE714C2DbfDAC4fDCbEAe9d0d72c8031D5"
+    }
+  }
+}

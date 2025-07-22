@@ -6,6 +6,7 @@ import { connectDB } from './db';
 import CrossBridgeRecord from './model/CrossBridgeRecord.model';
 import { sendToUser } from './WebSocket/websocket';
 import ws from 'ws';
+import { QueueChecker } from './utils/queueChecker';
 
 
 dotenv.config();
@@ -43,9 +44,21 @@ const mintContract = new ethers.Contract(
 export async function startListening() {
     await connectDB();
     console.log('✅ 已连接数据库，开始监听 A 链 LockTokens 合约的 Locked 事件...');
+    
+    // 初始化队列检查器
+    const queueChecker = new QueueChecker({
+        mintContract,
+        lockTokensContract: lockContract,
+        bProvider,
+        ethProvider: aProvider
+    });
+    
+    // 启动时检查待处理队列
+    await queueChecker.checkPendingQueue();
+    
     const socket = aProvider.websocket as ws.WebSocket;
 
-    lockContract.on('Locked', async (sender, receiver, amount, fee, crosschainHash, event) => {
+    lockContract.on('AssetLocked', async (sender, receiver, amount, fee, crosschainHash, event) => {
         const txHash = event.log.transactionHash;
         console.log('\n🔔 监听到 Locked 事件:', {
             sender,
@@ -182,8 +195,28 @@ export async function startListening() {
         console.error('❌ A链 WebSocket 错误:', err);
     });
 
-    socket.on('close', (code: number) => {
+    socket.on('close', async (code: number) => {
         console.warn(`⚠️ A链 WebSocket 连接关闭，code: ${code}，尝试重连...`);
+        
+        // 断线重连后重新检查队列
+        try {
+            await queueChecker.checkPendingQueue();
+            console.log('✅ 断线重连后队列检查完成');
+        } catch (error) {
+            console.error('❌ 断线重连后队列检查失败:', error);
+        }
+        
         setTimeout(startListening, 3000);
     });
+    
+    // 定期检查队列（每30分钟检查一次）
+    setInterval(async () => {
+        try {
+            console.log('🔄 定期检查队列...');
+            await queueChecker.checkPendingQueue();
+            console.log('✅ 定期队列检查完成');
+        } catch (error) {
+            console.error('❌ 定期队列检查失败:', error);
+        }
+    }, 30 * 60 * 1000); // 30分钟
 }
