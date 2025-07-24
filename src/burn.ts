@@ -4,27 +4,28 @@ import BurnManagerAbi from './abi/BurnManager.json';
 import MintTokensAbi from './abi/MintTokens.json';
 import LockTokensAbi from './abi/LockTokens.json';
 import { connectDB } from './db';
-import LockModel from './model/CrossBridgeRecord.model';
+import CrossBridgeRecord from './model/CrossBridgeRecord.model';
 import { sendToUser } from './WebSocket/websocket';
 import { QueueChecker } from './utils/queueChecker';
+import * as fs from 'fs';
+import * as path from 'path';
 
 dotenv.config();
 
 const {
-    BURN_CONTRACT_ADDRESS,
-    LOCK_CONTRACT_ADDRESS,
-    MINT_CONTRACT_ADDRESS,
     PRIVATE_KEY,
     IMUA_RPC_URL,
     ETH_RPC_URL,
-    ETH_API_KEY
+    ETH_API_KEY,
+    PLATON_RPC_URL
 } = process.env;
 
-
-if (!LOCK_CONTRACT_ADDRESS || !MINT_CONTRACT_ADDRESS || !BURN_CONTRACT_ADDRESS || !PRIVATE_KEY || !IMUA_RPC_URL || !ETH_RPC_URL) {
+if (!PRIVATE_KEY || !IMUA_RPC_URL || !ETH_RPC_URL || !PLATON_RPC_URL) {
     throw new Error('❌ 请检查 .env 文件，确保所有必要的环境变量已配置');
 }
 
+// 读取部署地址配置文件
+const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi/deployed_addresses.json'), 'utf8'));
 
 function createWssProvider(url: string): ethers.Provider {
     if (!url.startsWith('wss')) {
@@ -33,266 +34,71 @@ function createWssProvider(url: string): ethers.Provider {
     return new WebSocketProvider(url);
 }
 
-const aProvider = createWssProvider(IMUA_RPC_URL); 
-const bProvider = createWssProvider(IMUA_RPC_URL); 
-const ethProvider = createWssProvider(`${ETH_RPC_URL}${ETH_API_KEY}`); 
+// 创建提供者
+const imuaProvider = createWssProvider(IMUA_RPC_URL); 
+const sepoliaProvider = createWssProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
+const platonProvider = createWssProvider(PLATON_RPC_URL);
 
-const bWallet = new ethers.Wallet(PRIVATE_KEY, bProvider);
-const ethWallet = new ethers.Wallet(PRIVATE_KEY, ethProvider);
+// 创建钱包
+const wallet = new ethers.Wallet(PRIVATE_KEY!);
+const imuaWallet = wallet.connect(imuaProvider);
+const sepoliaWallet = wallet.connect(sepoliaProvider);
+const platonWallet = wallet.connect(platonProvider);
 
+// 创建源链的锁定合约实例 - 使用新的配置结构
+const sepoliaLockContract = new ethers.Contract(
+    deployedAddresses.LOCK_CONTRACTS['Ethereum-Sepolia'],
+    LockTokensAbi.abi,
+    sepoliaWallet
+);
 
-const fs = require('fs');
-const path = require('path');
-const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi/deployed_addresses.json'), 'utf8'));
-const burnManagerContract = new ethers.Contract(BURN_CONTRACT_ADDRESS, BurnManagerAbi.abi, aProvider);
-const mintContract = new ethers.Contract(MINT_CONTRACT_ADDRESS, MintTokensAbi.abi, bWallet);
-const lockTokensContract = new ethers.Contract(LOCK_CONTRACT_ADDRESS, LockTokensAbi.abi, ethWallet);
-
+const platonLockContract = new ethers.Contract(
+    deployedAddresses.LOCK_CONTRACTS['PlatON-Mainnet'],
+    LockTokensAbi.abi,
+    platonWallet
+);
 
 export async function startBurnListening() {
     await connectDB();
-    console.log('✅ 已连接数据库，准备监听 BurnManager 的 Burned 事件...');
+    console.log('✅ 已连接数据库，准备监听 IMUA 链上所有目标合约的 Burned 事件...');
 
     // 初始化队列检查器
     const queueChecker = new QueueChecker({
-        mintContract,
-        lockTokensContract: lockTokensContract,
-        bProvider: aProvider,
-        ethProvider: ethProvider
+        mintContract: new ethers.Contract(deployedAddresses.TOKEN_CONTRACTS['Imua-Testnet']['maoETH'], MintTokensAbi.abi, imuaWallet),
+        lockTokensContract: sepoliaLockContract,
+        bProvider: imuaProvider,
+        ethProvider: sepoliaProvider,
+        wallet: imuaWallet
     });
     
     // 启动时检查待处理队列
     await queueChecker.checkPendingQueue();
     
-    let lastBlock = await aProvider.getBlockNumber();
+    // 监听所有 IMUA 链上的目标合约
+    const targetContracts = deployedAddresses.TOKEN_CONTRACTS['Imua-Testnet'];
 
-    async function pollBurnedEvents() {
-        try {
-            const currentBlock = await aProvider.getBlockNumber();
-            if (currentBlock <= lastBlock) {
-                return setTimeout(pollBurnedEvents, 10000);
-            }
-
-            const events = await burnManagerContract.queryFilter(
-                burnManagerContract.filters.Burned(),
-                lastBlock + 1,
-                currentBlock
-            );
-
-            for (const event of events) {
-                const args = (event as any).args || [];
-                const [burner, amount, sepoliaRecipient, crosschainHash] = args;
-                const txHash = event.transactionHash;
-
-                // 事件一开始，先更新 sourceFromTxStatus
-                const before = await LockModel.findOne({ sourceFromTxHash: txHash });
-                console.log('更新前查到的记录:', before);
-
-                await LockModel.updateOne(
-                    { sourceFromTxHash: txHash },
-                    { $set: { sourceFromTxStatus: 'success' } }
-                );
-
-                const after = await LockModel.findOne({ sourceFromTxHash: txHash });
-                console.log('更新后查到的记录:', after);
-
-                console.log('🔥 检测到 Burned 事件:', {
-                    burner,
-                    amount: amount?.toString(),
-                    sepoliaRecipient,
-                    crosschainHash,
-                    txHash
-                });
-
-                let tokenName = '';
-                let destinationChainId = null;
-                let recipientAddress = null;
-
-                // 先从数据库查 tokenName 和 chainId/recipient
-                const record = await LockModel.findOne({ sourceFromTxHash: txHash });
-                if (record?.sourceFromTokenName) {
-                    tokenName = record.sourceFromTokenName;
-                    console.log('🧩 数据库获取 tokenName:', tokenName, 'destinationChainId:', destinationChainId, 'recipientAddress:', recipientAddress);
+    if (targetContracts !== null && typeof targetContracts === 'object') {
+        for (const [tokenKey, contractValue] of Object.entries(targetContracts)) {
+            if (typeof contractValue === 'string') {
+                // 跳过空地址的监听（如 IMUA 原生代币）
+                if (contractValue && contractValue.trim() !== '') {
+                    listenToBurnContract(contractValue, tokenKey, queueChecker);
                 } else {
-                    try {
-                        const tokenAddress = await burnManagerContract.token();
-                        const tokenContract = new ethers.Contract(tokenAddress, MintTokensAbi.abi, aProvider);
-                        tokenName = await tokenContract.name();
-                        console.log('🔗 链上获取 tokenName:', tokenName);
-                    } catch (err) {
-                        console.error('⚠️ 无法从链上获取 token name:', err);
+                    console.log(`⏭️ 跳过空地址的合约监听: ${tokenKey}`);
+                }
+            } else if (contractValue !== null && typeof contractValue === 'object') {
+                // 处理嵌套对象（如 maoUSDC 根据目标网络不同使用不同地址）
+                const nestedContracts = contractValue as { [key: string]: unknown };
+                for (const [networkType, address] of Object.entries(nestedContracts)) {
+                    if (typeof address === 'string' && address && address.trim() !== '') {
+                        listenToBurnContract(address, `${tokenKey}_${networkType}`, queueChecker);
+                    } else if (typeof address === 'string' && (!address || address.trim() === '')) {
+                        console.log(`⏭️ 跳过空地址的嵌套合约监听: ${tokenKey}_${networkType}`);
                     }
                 }
-
-                if (!tokenName) {
-                    console.error('❌ 跳过该事件：无法识别 tokenName，txHash:', txHash);
-                    continue;
-                }
-
-                // 动态选择目标合约地址
-                let targetContractAddress = null;
-                if (destinationChainId) {
-                    targetContractAddress = deployedAddresses.imua.targets[`target_${destinationChainId}`];
-                }
-                if (!targetContractAddress) {
-                    // 默认 fallback
-                    targetContractAddress = deployedAddresses.imua.targets.target_11155111;
-                }
-                const mintContractDynamic = new ethers.Contract(targetContractAddress, MintTokensAbi.abi, bWallet);
-                const lockTokensContractDynamic = new ethers.Contract(targetContractAddress, LockTokensAbi.abi, bWallet);
-
-                if (tokenName.startsWith('mao')) {
-                    // mint
-                    try {
-                        const tx = await mintContractDynamic.mint(recipientAddress || sepoliaRecipient, amount, crosschainHash);
-                        console.log('📤 发送 mint 交易，txHash:', tx.hash);
-                        await tx.wait();
-                        console.log('✅ mint 交易已确认');
-
-                        sendToUser(sepoliaRecipient, {
-                            type: 'MINT_SUCCESS',
-                            data: { targetToTxHash: tx.hash }
-                        });
-
-                        // mint 成功后，轮询查找并更新 targetToTxStatus，最多重试3次
-                        {
-                            const maxRetry = 3;
-                            let retry = 0;
-                            let updated = false;
-                            while (retry < maxRetry && !updated) {
-                                await new Promise(res => setTimeout(res, 2000));
-                                const record = await LockModel.findOne({ sourceFromTxHash: txHash });
-                                if (record) {
-                                    await LockModel.updateOne(
-                                        { sourceFromTxHash: txHash },
-                                        { $set: { targetToTxStatus: 'success' } }
-                                    );
-                                    console.log(`✅ 第${retry + 1}次重试后，成功更新 targetToTxStatus 为 success`);
-                                    updated = true;
-                                } else {
-                                    console.log(`⏳ 第${retry + 1}次重试，仍未查到记录，txHash: ${txHash}`);
-                                    retry++;
-                                }
-                            }
-                            if (!updated) {
-                                console.warn('⚠️ 多次重试后仍未查到记录，未能更新 targetToTxStatus:', txHash);
-                            }
-
-                            // 轮询 targetToTxStatus 成功后，再更新 crossBridgeStatus
-                            if (updated) {
-                                const finalRecord = await LockModel.findOne({ sourceFromTxHash: txHash });
-                                const isSourceSuccess = finalRecord?.sourceFromTxStatus === 'success' || true;
-                                const isTargetSuccess = finalRecord?.targetToTxStatus === 'success';
-                                if (isSourceSuccess && isTargetSuccess) {
-                                    await LockModel.updateOne(
-                                        { sourceFromTxHash: txHash },
-                                        { $set: { crossBridgeStatus: 'minted' } }
-                                    );
-                                    console.log('🎉 crossBridgeStatus 已更新为 minted');
-                                }
-                            }
-                        }
-                    } catch (err: any) {
-                        console.error('❌ mint 铸币失败:', err.message || err);
-                        sendToUser(sepoliaRecipient, {
-                            type: 'MINT_FAILED',
-                            data: { error: err.message || err }
-                        });
-                    }
-                } else {
-                    // unlock
-                    try {
-                        const tx = await lockTokensContractDynamic.unlock(recipientAddress || sepoliaRecipient, amount, crosschainHash);
-                        console.log('🔓 发送 unlock 交易，txHash:', tx.hash);
-                        await tx.wait();
-                        console.log('✅ unlock 交易已确认');
-
-                        sendToUser(sepoliaRecipient, {
-                            type: 'UNLOCK_SUCCESS',
-                            data: { targetToTxHash: tx.hash }
-                        });
-
-                        // unlock 成功后，写入 targetToTxHash
-                        await LockModel.updateOne(
-                            { sourceFromTxHash: txHash },
-                            { $set: { targetToTxHash: tx.hash } }
-                        );
-                        console.log('✅ 已写入 targetToTxHash:', tx.hash);
-
-                        // unlock 成功后，轮询查找并更新 targetToTxStatus，最多重试3次
-                        {
-                            const maxRetry = 3;
-                            let retry = 0;
-                            let updated = false;
-                            while (retry < maxRetry && !updated) {
-                                await new Promise(res => setTimeout(res, 2000));
-                                const record = await LockModel.findOne({ sourceFromTxHash: txHash });
-                                if (record) {
-                                    await LockModel.updateOne(
-                                        { sourceFromTxHash: txHash },
-                                        { $set: { targetToTxStatus: 'success' } }
-                                    );
-                                    console.log(`✅ 第${retry + 1}次重试后，成功更新 targetToTxStatus 为 success`);
-                                    updated = true;
-                                } else {
-                                    console.log(`⏳ 第${retry + 1}次重试，仍未查到记录，txHash: ${txHash}`);
-                                    retry++;
-                                }
-                            }
-                            if (!updated) {
-                                console.warn('⚠️ 多次重试后仍未查到记录，未能更新 targetToTxStatus:', txHash);
-                            }
-
-                            // 轮询 targetToTxStatus 成功后，再更新 crossBridgeStatus
-                            if (updated) {
-                                const finalRecord = await LockModel.findOne({ sourceFromTxHash: txHash });
-                                const isSourceSuccess = finalRecord?.sourceFromTxStatus === 'success' || true;
-                                const isTargetSuccess = finalRecord?.targetToTxStatus === 'success';
-                                if (isSourceSuccess && isTargetSuccess) {
-                                    await LockModel.updateOne(
-                                        { sourceFromTxHash: txHash },
-                                        { $set: { crossBridgeStatus: 'minted' } }
-                                    );
-                                    console.log('🎉 crossBridgeStatus 已更新为 minted');
-                                }
-                            }
-                        }
-                    } catch (err: any) {
-                        console.error('❌ 解锁失败:', err.message || err);
-                        sendToUser(sepoliaRecipient, {
-                            type: 'UNLOCK_FAILED',
-                            data: { error: err.message || err }
-                        });
-                    }
-                }
-            }
-
-            lastBlock = currentBlock;
-        } catch (err: any) {
-            console.error('⚠️ 轮询错误:', err.message || err);
-            
-            // 如果是连接错误，尝试重新检查队列
-            if (err.message?.includes('connection') || err.message?.includes('network')) {
-                console.log('🔄 检测到连接错误，重新检查队列...');
-                try {
-                    await queueChecker.checkPendingQueue();
-                    console.log('✅ 连接错误后队列检查完成');
-                } catch (queueError) {
-                    console.error('❌ 连接错误后队列检查失败:', queueError);
-                }
-            }
-            
-            try {
-                lastBlock = await aProvider.getBlockNumber();
-            } catch (innerErr) {
-                console.error('❌ 获取当前区块失败:', innerErr);
             }
         }
-
-        setTimeout(pollBurnedEvents, 10000);
     }
-
-    pollBurnedEvents();
     
     // 定期检查队列（每30分钟检查一次）
     setInterval(async () => {
@@ -306,6 +112,335 @@ export async function startBurnListening() {
     }, 30 * 60 * 1000); // 30分钟
 }
 
+async function listenToBurnContract(contractAddress: string, contractKey: string, queueChecker: QueueChecker) {
+    console.log(`🔥 开始监听合约 ${contractKey} (${contractAddress}) 的 TokensBurned 事件`);
+    
+    // 创建合约实例（使用 MintTokens ABI，因为我们要监听 TokensBurned 事件）
+    const burnContract = new ethers.Contract(contractAddress, MintTokensAbi.abi, imuaProvider);
+    
+    burnContract.on('TokensBurned', (...args) => {
+        const event = args[args.length - 1];
+        handleBurnedEvent(event, contractKey, queueChecker);
+    });
+}
+
+async function handleBurnedEvent(event: any, contractKey: string, queueChecker: QueueChecker) {
+    try {
+        // 确保 event 对象包含必要的属性
+        if (!event || !event.args || !event.log) {
+            console.error('❌ 事件对象缺少必要的属性:', event);
+            return;
+        }
+
+        const txHash = event.log.transactionHash;
+        console.log(`🔥 检测到 TokensBurned 事件 - 合约: ${contractKey}, 交易哈希: ${txHash}`);
+        
+        // 解析事件参数
+        const { transactionId, burner: user, sourceChainId, recipientAddress, amount } = event.args;
+        let tokenAddress = event.log.address;
+
+        // 确保所有必要的参数都存在
+        if (!transactionId || !user || !sourceChainId || !recipientAddress || !amount || !tokenAddress) {
+            console.error('❌ 事件参数不完整:', event.args);
+            return;
+        }
+
+        console.log(`📋 TokensBurned 事件详情:`, {
+            transactionId: transactionId.toString(),
+            user,
+            sourceChainId: sourceChainId.toString(),
+            recipientAddress,
+            tokenAddress,
+            amount: ethers.formatEther(amount),
+            txHash
+        });
+        
+        // 检查数据库中是否已存在该记录
+        const existingRecord = await CrossBridgeRecord.findOne({ transactionId: transactionId.toString() });
+        if (existingRecord) {
+            console.log(`⚠️ 交易ID ${transactionId.toString()} 已存在，跳过处理`);
+            return;
+        }
+        
+        // 根据源链ID确定要解锁的链和合约
+        let unlockContract;
+        let unlockProvider;
+        let targetChainName;
+        
+        const sourceChainIdNum = parseInt(sourceChainId.toString());
+        
+        if (sourceChainIdNum === 11155111) { // Sepolia
+            unlockContract = sepoliaLockContract;
+            unlockProvider = sepoliaProvider;
+            targetChainName = 'Ethereum-Sepolia';
+        } else if (sourceChainIdNum === 210425) { // Platon
+            unlockContract = platonLockContract;
+            unlockProvider = platonProvider;
+            targetChainName = 'PlatON-Mainnet';
+        } else if (sourceChainIdNum === 233) { // Imua
+            // Imua 链上的销毁事件，需要解锁到对应的源链
+            // 这里需要根据具体情况决定解锁到哪个链
+            console.log(`🔍 Imua 链上的销毁事件，需要确定解锁目标链`);
+            return;
+        } else if (sourceChainIdNum === 7001) { // ZetaChain
+            // ZetaChain 链上的销毁事件，需要解锁到对应的源链
+            console.log(`🔍 ZetaChain 链上的销毁事件，需要确定解锁目标链`);
+            return;
+        } else {
+            console.error(`❌ 不支持的源链ID: ${sourceChainIdNum}`);
+            return;
+        }
+        
+        console.log(`🔓 准备在 ${targetChainName} 链上解锁代币`);
+        
+        // === 代币类型映射：锚定代币映射为原生代币 ===
+        const tokenMapping: { [key: string]: string } = {
+            // Imua-Testnet 上的锚定代币映射
+            '0x4a91a4a24b6883dbbddc6e6704a3c0e96396d2e9': '0x0000000000000000000000000000000000000000', // maoETH -> ETH
+            '0x924A9fb56b2b1B5554327823b201b7eEF691E524': '0x0000000000000000000000000000000000000000', // maoLAT -> LAT
+            '0xFCE1AC30062EfDD9119F6527392D4B935397f714': '0x0000000000000000000000000000000000000000', // maoZETA -> ZETA
+            '0xDFEc8F8C99eC22AA21e392Aa00eFb3F517C44987': '0x0000000000000000000000000000000000000000', // maoEURC -> EURC
+            '0x4ed64b15ab26b8fe3905b4101beccc1d5b3d49fd': '0x0000000000000000000000000000000000000000', // maoUSDC(PlatON) -> USDC
+            '0xe5a26a2c90b6e629861bb25f10177f06720e5335': '0x0000000000000000000000000000000000000000', // maoUSDC(Sepolia) -> USDC
+        };
+        
+        const originalTokenAddress = tokenAddress;
+        const tokenAddressStr = tokenAddress.toString().toLowerCase();
+        const mappedTokenAddress = tokenMapping[tokenAddressStr];
+        if (mappedTokenAddress) {
+            tokenAddress = mappedTokenAddress;
+            console.log(`🔄 检测到锚定代币 ${originalTokenAddress}，解锁时映射为原生代币 ${tokenAddress}`);
+        }
+
+        // 创建跨链记录，确保所有必填字段都有值
+        const crossBridgeRecord = new CrossBridgeRecord({
+            transactionId: transactionId.toString(),
+            sourceChainId: 233, // IMUA 链ID
+            sourceChain: 'imua',
+            sourceRpc: IMUA_RPC_URL,
+            sourceFromAddress: user,
+            sourceFromTokenName: contractKey.split('_').pop() || 'unknown', // 从合约键名中提取代币名称
+            sourceFromTokenContractAddress: tokenAddress, // 确保这个字段有值
+            sourceFromAmount: amount.toString(),
+            sourceFromHandingFee: '0', // 假设手续费为0，根据实际情况修改
+            sourceFromRealAmount: amount.toString(),
+            sourceFromTxHash: txHash, // 确保这个字段有值
+            sourceFromTxStatus: 'success',
+
+            targetChainId: sourceChainIdNum,
+            targetChain: targetChainName.toLowerCase(),
+            targetRpc: sourceChainIdNum === 11155111 ? `${ETH_RPC_URL}${ETH_API_KEY}` : PLATON_RPC_URL,
+            targetToAddress: recipientAddress,
+            targetToTokenName: contractKey.split('_').pop() || 'unknown', // 假设目标代币名称与源代币相同
+            targetToTokenContractAddress: tokenAddress, // 确保这个字段有值
+            targetToReceiveAmount: amount.toString(),
+            targetToCallContractAddress: unlockContract.target,
+            targetToGas: '0', // 稍后在执行解锁时更新
+            targetToTxHash: '0x', // 稍后在执行解锁时更新
+            targetToTxStatus: 'pending',
+
+            crossBridgeStatus: 'pending',
+        });
+        
+        await crossBridgeRecord.save();
+        console.log(`✅ 已保存跨链记录到数据库`);
+        
+        // 执行解锁操作
+        try {
+            console.log(`🔓 开始在 ${targetChainName} 链上解锁代币...`);
+            
+            // 根据 LockTokens.json ABI，正确的函数名是 unlock 而不是 unlockTokens
+            // unlock 函数需要 5 个参数：_txId, _token, _recipient, _amount, _signature
+            
+            // 生成签名 - 参考 index.ts 中的签名生成逻辑
+            console.log('🔐 开始生成签名...');
+            
+            // 构造消息哈希（匹配合约逻辑）
+            // 合约期望的消息哈希格式：keccak256(abi.encodePacked(txId, token, recipient, amount))
+            // 注意：合约中没有包含 address(this)，这是我们之前的错误
+            const messageHash = ethers.solidityPackedKeccak256(
+                ['bytes32', 'address', 'address', 'uint256'],
+                [transactionId, tokenAddress, recipientAddress, amount]
+            );
+            
+            console.log('🔐 消息哈希:', messageHash);
+            console.log('🔐 签名参数:', {
+                txId: transactionId,
+                token: tokenAddress,
+                recipient: recipientAddress,
+                amount: amount.toString()
+            });
+            
+            // 将哈希转换为以太坊签名消息格式
+            // 在合约中使用了 messageHash.toEthSignedMessageHash()
+            const ethSignedMessageHash = ethers.hashMessage(ethers.getBytes(messageHash));
+            console.log('🔐 以太坊签名消息哈希:', ethSignedMessageHash);
+            
+            // 使用钱包签名消息
+            let wallet;
+            if (targetChainName === 'Ethereum-Sepolia') {
+                wallet = sepoliaWallet;
+            } else if (targetChainName === 'PlatON-Mainnet') {
+                wallet = platonWallet;
+            } else {
+                console.error(`❌ 未知的目标链: ${targetChainName}`);
+                return;
+            }
+            
+            // 直接对原始消息哈希进行签名，ethers.js 会自动添加前缀
+            const signature = await wallet.signMessage(ethers.getBytes(messageHash));
+            
+            console.log('✅ 签名生成成功:', signature.slice(0, 20) + '...');
+            
+            // 检查合约中的代币余额
+            console.log('🔍 检查合约代币余额...');
+            try {
+                let contractBalance;
+                let tokenContract;
+                let symbol = 'ETH';
+                let decimals = 18;
+                
+                if (tokenAddress === '0x0000000000000000000000000000000000000000') {
+                    // 检查原生代币余额
+                    // 确保使用正确的provider
+                    contractBalance = await unlockProvider.getBalance(unlockContract.target);
+                    console.log(`💰 合约原生代币余额: ${ethers.formatEther(contractBalance)} ETH`);
+                } else {
+                    // 检查ERC20代币余额
+                    tokenContract = new ethers.Contract(
+                        tokenAddress,
+                        [
+                            'function balanceOf(address account) view returns (uint256)',
+                            'function symbol() view returns (string)',
+                            'function decimals() view returns (uint8)',
+                            'function allowance(address owner, address spender) view returns (uint256)'
+                        ],
+                        unlockProvider
+                    );
+                    
+                    contractBalance = await tokenContract.balanceOf(unlockContract.target);
+                    symbol = await tokenContract.symbol().catch(() => 'TOKEN');
+                    decimals = await tokenContract.decimals().catch(() => 18);
+                    
+                    console.log(`💰 合约 ${symbol} 代币余额: ${ethers.formatUnits(contractBalance, decimals)} ${symbol}`);
+                    
+                    // 检查代币是否已经授权给合约
+                    try {
+                        // 检查钱包对合约的授权
+                        // 使用对应链的钱包地址
+                        const walletAddress = sourceChainIdNum === 11155111 ? 
+                            await sepoliaWallet.getAddress() : 
+                            await platonWallet.getAddress();
+                        const allowance = await tokenContract.allowance(walletAddress, unlockContract.target);
+                        console.log(`🔑 钱包对合约的授权额度: ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
+                        
+                        if (allowance < amount) {
+                            console.error(`❌ 授权额度不足! 需要 ${ethers.formatUnits(amount, decimals)} ${symbol}，但只授权了 ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
+                            console.log('💡 请确保已经授权足够的代币给合约');
+                            return;
+                        }
+                    } catch (allowanceError) {
+                        console.error('❌ 检查授权额度时出错:', allowanceError);
+                    }
+                }
+                
+                // 检查余额是否足够
+                if (contractBalance < amount) {
+                    console.error(`❌ 合约余额不足! 需要 ${ethers.formatUnits(amount, decimals)} ${symbol}，但只有 ${ethers.formatUnits(contractBalance, decimals)} ${symbol}`);
+                    console.log('💡 请确保合约中有足够的代币余额');
+                    return;
+                }
+                
+                console.log('✅ 合约余额充足，继续执行...');
+            } catch (balanceError) {
+                console.error('❌ 检查余额时出错:', balanceError);
+            }
+            
+            // 测试签名是否有效
+            console.log('🧪 测试签名有效性...');
+            try {
+                await unlockContract.unlock.staticCall(
+                    transactionId,
+                    tokenAddress,
+                    recipientAddress,
+                    amount,
+                    signature
+                );
+                console.log('✅ 签名验证成功！准备执行实际 unlock 操作');
+            } catch (testError) {
+                console.error('❌ 签名验证失败:', testError);
+                console.log('💡 可能需要进一步调试签名格式');
+                return;
+            }
+            
+            // 执行 unlock 操作
+            const unlockTx = await unlockContract.unlock(
+                transactionId,
+                tokenAddress,
+                recipientAddress,
+                amount,
+                signature,
+                { gasLimit: 500000 } // 设置足够的 gas 限制
+            );
+            
+            console.log(`📤 解锁交易已发送 - 哈希: ${unlockTx.hash}`);
+            
+            // 等待交易确认
+            const receipt = await unlockTx.wait();
+            console.log(`✅ 解锁交易已确认 - 区块: ${receipt.blockNumber}`);
+            
+            // 更新记录状态
+            await CrossBridgeRecord.updateOne(
+                { transactionId: transactionId.toString() },
+                { 
+                    crossBridgeStatus: 'minted',
+                    targetToTxHash: unlockTx.hash,
+                    targetToTxStatus: 'success',
+                    updatedAt: new Date()
+                }
+            );
+            
+            console.log(`🎉 跨链解锁完成 - 交易ID: ${transactionId.toString()}`);
+            
+            // 发送 WebSocket 通知
+            sendToUser(recipientAddress, {
+                type: 'UNLOCK_SUCCESS',
+                data: { 
+                    unlockTxHash: unlockTx.hash,
+                    transactionId: transactionId.toString(),
+                    sourceChain: targetChainName,
+                    amount: ethers.formatEther(amount)
+                }
+            });
+            
+        } catch (unlockError: any) {
+            console.error(`❌ 解锁操作失败:`, unlockError);
+            
+            // 更新记录状态为失败
+            await CrossBridgeRecord.updateOne(
+                { transactionId: transactionId.toString() },
+                { 
+                    crossBridgeStatus: 'failed',
+                    targetToTxStatus: 'failed',
+                    updatedAt: new Date()
+                }
+            );
+            
+            // 发送 WebSocket 通知
+            sendToUser(recipientAddress, {
+                type: 'UNLOCK_FAILED',
+                data: { 
+                    error: unlockError.message,
+                    transactionId: transactionId.toString(),
+                    sourceChain: targetChainName
+                }
+            });
+        }
+        
+    } catch (error) {
+        console.error(`❌ 处理 Burned 事件时出错:`, error);
+    }
+}
 
 if (require.main === module) {
     startBurnListening();

@@ -50,7 +50,8 @@ export async function manualQueueCheck() {
             mintContract,
             lockTokensContract: lockContract,
             bProvider,
-            ethProvider: aProvider
+            ethProvider: aProvider,
+            wallet: bWallet
         });
         
         // 检查待处理队列
@@ -77,4 +78,4 @@ if (require.main === module) {
             console.error('💥 手动队列检查执行失败:', error);
             process.exit(1);
         });
-} 
+}
