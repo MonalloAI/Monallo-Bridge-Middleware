@@ -4,7 +4,7 @@ import { parse } from 'url';
 // 用 Map 保存 address → socket
 const userSockets = new Map<string, WebSocket>();
 
-const wss = new WebSocketServer({ port: 8888 });
+const wss = new WebSocketServer({ port: 8889 });
 
 wss.on('connection', (ws, req) => {
   const query = parse(req.url!, true).query;
