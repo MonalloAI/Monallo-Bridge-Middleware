@@ -454,18 +454,33 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             const receipt = await unlockTx.wait();
             console.log(`✅ 解锁交易已确认 - 区块: ${receipt.blockNumber}`);
             
-            // 更新记录状态
-            await CrossBridgeRecord.updateOne(
-                { transactionId: transactionId.toString() },
-                { 
-                    crossBridgeStatus: 'minted',
-                    targetToTxHash: unlockTx.hash,
-                    targetToTxStatus: 'success',
-                    updatedAt: new Date()
+            // === 新增重试机制 ===
+            const maxRetry = 3;
+            let retry = 0;
+            let updated = false;
+            while (retry < maxRetry && !updated) {
+                await new Promise(res => setTimeout(res, 2000));
+                const record = await CrossBridgeRecord.findOne({ transactionId: transactionId.toString() });
+                if (record) {
+                    await CrossBridgeRecord.updateOne(
+                        { transactionId: transactionId.toString() },
+                        { 
+                            crossBridgeStatus: 'minted',
+                            targetToTxHash: unlockTx.hash,
+                            targetToTxStatus: 'success',
+                            updatedAt: new Date()
+                        }
+                    );
+                    console.log(`✅ 第${retry + 1}次重试后，成功更新跨链记录状态`);
+                    updated = true;
+                } else {
+                    console.log(`⏳ 第${retry + 1}次重试，仍未查到记录，transactionId: ${transactionId.toString()}`);
+                    retry++;
                 }
-            );
-            
-            console.log(`🎉 跨链解锁完成 - 交易ID: ${transactionId.toString()}`);
+            }
+            if (!updated) {
+                console.warn('⚠️ 多次重试后仍未查到记录，未能更新状态:', transactionId.toString());
+            }
             
             // 发送 WebSocket 通知
             sendToUser(recipientAddress, {
