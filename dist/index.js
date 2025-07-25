@@ -112,6 +112,8 @@ function startListening() {
                     return;
                 }
                 // B 链 mint 代币
+                
+                
                 const tx = yield mintContract.mint(receiver, amount, crosschainHash);
                 console.log('🚀 已发送 B 链 mint 交易，txHash:', tx.hash);
                 yield tx.wait();
