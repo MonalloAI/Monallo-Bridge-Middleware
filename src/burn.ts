@@ -137,7 +137,76 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         
         // 解析事件参数
         const { transactionId, burner: user, sourceChainId, recipientAddress, amount } = event.args;
-        let tokenAddress = event.log.address;
+        
+        // === 动态币种映射：根据销毁合约地址查找币种类型和目标链 ===
+        // 1. 获取 deployedAddresses
+        const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi/deployed_addresses.json'), 'utf8'));
+        // 2. 反查币种类型和 maoKey
+        function findBurnedTokenTypeAndMaoKey(burnedAddress: string) {
+            const imuaTokens = deployedAddresses.TOKEN_CONTRACTS['Imua-Testnet'];
+            for (const [maoKey, value] of Object.entries(imuaTokens)) {
+                if (typeof value === 'string') {
+                    if (value.toLowerCase() === burnedAddress.toLowerCase()) {
+                        return { type: maoKey.replace('mao', ''), maoKey, sourceChain: null };
+                    }
+                } else if (typeof value === 'object' && value !== null) {
+                    for (const [chain, addr] of Object.entries(value)) {
+                        if (typeof addr === 'string' && addr.toLowerCase() === burnedAddress.toLowerCase()) {
+                            return { type: maoKey.replace('mao', ''), maoKey, sourceChain: chain };
+                        }
+                    }
+                }
+            }
+            return null;
+        }
+        // 3. 获取目标链币种合约地址
+        function getTargetTokenAddress(tokenType: string, targetChainName: string) {
+            // 原生币
+            const nativeMap = {
+                'ETH': '0x0000000000000000000000000000000000000000',
+                'LAT': '0x0000000000000000000000000000000000000000',
+                'IMUA': '0x0000000000000000000000000000000000000000',
+                'ZETA': '0x0000000000000000000000000000000000000000',
+            };
+            if (nativeMap[tokenType.toUpperCase() as keyof typeof nativeMap]) return nativeMap[tokenType.toUpperCase() as keyof typeof nativeMap];
+            // ERC20
+            const tokenContracts = deployedAddresses.TOKEN_CONTRACTS[targetChainName];
+            if (!tokenContracts) return null;
+            // 先查主币名
+            if (tokenContracts[tokenType]) return tokenContracts[tokenType];
+            // 再查锚定币名
+            if (tokenContracts['mao' + tokenType]) return tokenContracts['mao' + tokenType];
+            return null;
+        }
+        // 4. 反查币种类型
+        const burnedTokenInfo = findBurnedTokenTypeAndMaoKey(event.log.address);
+        if (!burnedTokenInfo) {
+            console.error('❌ 未能识别销毁的锚定币种:', event.log.address);
+            return;
+        }
+        // 5. 获取目标链名
+        let targetChainKey = '';
+        const sourceChainIdNum = parseInt(sourceChainId.toString());
+        if (sourceChainIdNum === 11155111) targetChainKey = 'Ethereum-Sepolia';
+        else if (sourceChainIdNum === 210425) targetChainKey = 'PlatON-Mainnet';
+        else if (sourceChainIdNum === 7001) targetChainKey = 'ZetaChain-Testnet';
+        else if (sourceChainIdNum === 233) targetChainKey = 'Imua-Testnet';
+        else {
+            console.error('❌ 不支持的目标链ID:', sourceChainIdNum);
+            return;
+        }
+        // 6. 获取目标链币种合约地址
+        let tokenAddress = getTargetTokenAddress(burnedTokenInfo.type, targetChainKey);
+        if (!tokenAddress) {
+            console.error('❌ 未找到目标链币种合约地址:', burnedTokenInfo.type, targetChainKey);
+            return;
+        }
+        // 7. 单位换算（USDC等6位币种）
+        let unlockAmount = amount;
+        const decimals6 = ['USDC', 'maoUSDC'];
+        if (decimals6.includes(burnedTokenInfo.type.toUpperCase())) {
+            unlockAmount = amount * BigInt(10 ** 12);
+        }
 
         // 确保所有必要的参数都存在
         if (!transactionId || !user || !sourceChainId || !recipientAddress || !amount || !tokenAddress) {
@@ -167,8 +236,6 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         let unlockProvider;
         let targetChainName;
         
-        const sourceChainIdNum = parseInt(sourceChainId.toString());
-        
         if (sourceChainIdNum === 11155111) { // Sepolia
             unlockContract = sepoliaLockContract;
             unlockProvider = sepoliaProvider;
@@ -195,15 +262,13 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         
         // === 代币类型映射：锚定代币映射为原生代币 ===
         const tokenMapping: { [key: string]: string } = {
-            // Imua-Testnet 上的锚定代币映射
+            // 只保留原生币的映射
             '0x4a91a4a24b6883dbbddc6e6704a3c0e96396d2e9': '0x0000000000000000000000000000000000000000', // maoETH -> ETH
-            '0x924A9fb56b2b1B5554327823b201b7eEF691E524': '0x0000000000000000000000000000000000000000', // maoLAT -> LAT
-            '0xFCE1AC30062EfDD9119F6527392D4B935397f714': '0x0000000000000000000000000000000000000000', // maoZETA -> ZETA
-            '0xDFEc8F8C99eC22AA21e392Aa00eFb3F517C44987': '0x0000000000000000000000000000000000000000', // maoEURC -> EURC
-            '0x4ed64b15ab26b8fe3905b4101beccc1d5b3d49fd': '0x0000000000000000000000000000000000000000', // maoUSDC(PlatON) -> USDC
-            '0xe5a26a2c90b6e629861bb25f10177f06720e5335': '0x0000000000000000000000000000000000000000', // maoUSDC(Sepolia) -> USDC
+            '0x924a9fb56b2b1b5554327823b201b7eef691e524': '0x0000000000000000000000000000000000000000', // maoLAT -> LAT
+            '0xfce1ac30062efdd9119f6527392d4b935397f714': '0x0000000000000000000000000000000000000000', // maoZETA -> ZETA
+            '0xdfec8f8c99ec22aa21e392aa00efb3f517c44987': '0x0000000000000000000000000000000000000000', // maoEURC -> EURC
+            // 不要映射 maoUSDC、maoUSDT、maoEURC
         };
-        
         const originalTokenAddress = tokenAddress;
         const tokenAddressStr = tokenAddress.toString().toLowerCase();
         const mappedTokenAddress = tokenMapping[tokenAddressStr];
@@ -260,7 +325,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             // 注意：合约中没有包含 address(this)，这是我们之前的错误
             const messageHash = ethers.solidityPackedKeccak256(
                 ['bytes32', 'address', 'address', 'uint256'],
-                [transactionId, tokenAddress, recipientAddress, amount]
+                [transactionId, tokenAddress, recipientAddress, unlockAmount]
             );
             
             console.log('🔐 消息哈希:', messageHash);
@@ -268,7 +333,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                 txId: transactionId,
                 token: tokenAddress,
                 recipient: recipientAddress,
-                amount: amount.toString()
+                amount: unlockAmount.toString()
             });
             
             // 将哈希转换为以太坊签名消息格式
@@ -334,8 +399,8 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                         const allowance = await tokenContract.allowance(walletAddress, unlockContract.target);
                         console.log(`🔑 钱包对合约的授权额度: ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
                         
-                        if (allowance < amount) {
-                            console.error(`❌ 授权额度不足! 需要 ${ethers.formatUnits(amount, decimals)} ${symbol}，但只授权了 ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
+                        if (allowance < unlockAmount) {
+                            console.error(`❌ 授权额度不足! 需要 ${ethers.formatUnits(unlockAmount, decimals)} ${symbol}，但只授权了 ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
                             console.log('💡 请确保已经授权足够的代币给合约');
                             return;
                         }
@@ -345,8 +410,8 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                 }
                 
                 // 检查余额是否足够
-                if (contractBalance < amount) {
-                    console.error(`❌ 合约余额不足! 需要 ${ethers.formatUnits(amount, decimals)} ${symbol}，但只有 ${ethers.formatUnits(contractBalance, decimals)} ${symbol}`);
+                if (contractBalance < unlockAmount) {
+                    console.error(`❌ 合约余额不足! 需要 ${ethers.formatUnits(unlockAmount, decimals)} ${symbol}，但只有 ${ethers.formatUnits(contractBalance, decimals)} ${symbol}`);
                     console.log('💡 请确保合约中有足够的代币余额');
                     return;
                 }
@@ -363,7 +428,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                     transactionId,
                     tokenAddress,
                     recipientAddress,
-                    amount,
+                    unlockAmount,
                     signature
                 );
                 console.log('✅ 签名验证成功！准备执行实际 unlock 操作');
@@ -378,7 +443,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                 transactionId,
                 tokenAddress,
                 recipientAddress,
-                amount,
+                unlockAmount,
                 signature,
                 { gasLimit: 500000 } // 设置足够的 gas 限制
             );
@@ -409,7 +474,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                     unlockTxHash: unlockTx.hash,
                     transactionId: transactionId.toString(),
                     sourceChain: targetChainName,
-                    amount: ethers.formatEther(amount)
+                    amount: ethers.formatUnits(unlockAmount, 18)
                 }
             });
             

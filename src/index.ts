@@ -483,20 +483,32 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
     // 金额处理：用户锁定多少就铸造多少，gas费用由中继器承担
     const originalAmount = BigInt(amount.toString());
     const feeAmount = BigInt(fee.toString());
-    const mintAmount = originalAmount; // 铸造原始金额，不扣除手续费
+    let mintAmount = originalAmount; // 默认直接用原始金额
+    let mintFeeAmount = feeAmount;
+    // USDC 特殊处理：6位小数转18位
+    if (tokenType === 'USDC') {
+        const multiplier = BigInt(10 ** 12);
+        mintAmount = originalAmount * multiplier;
+        mintFeeAmount = feeAmount * multiplier;
+        console.log("🔢 USDC 单位换算详情:");
+        console.log("  转换前 originalAmount:", originalAmount.toString());
+        console.log("  转换前 feeAmount:", feeAmount.toString());
+        console.log("  转换后 mintAmount:", mintAmount.toString());
+        console.log("  转换后 mintFeeAmount:", mintFeeAmount.toString());
+    }
 
     // 详细日志记录
     console.log('💰 金额计算详情:');
-    console.log(`  用户锁定金额: ${originalAmount.toString()} wei (${ethers.formatEther(originalAmount)} ETH)`);
-    console.log(`  手续费: ${feeAmount.toString()} wei (${ethers.formatEther(feeAmount)} ETH)`);
-    console.log(`  实际铸造金额: ${mintAmount.toString()} wei (${ethers.formatEther(mintAmount)} ETH)`);
+    console.log(`  用户锁定金额: ${originalAmount.toString()} wei (${ethers.formatUnits(originalAmount, tokenType === 'USDC' ? 6 : 18)} ${tokenType})`);
+    console.log(`  手续费: ${feeAmount.toString()} wei (${ethers.formatUnits(feeAmount, tokenType === 'USDC' ? 6 : 18)} ${tokenType})`);
+    console.log(`  实际铸造金额: ${mintAmount.toString()} wei (${ethers.formatUnits(mintAmount, 18)} mao${tokenType})`);
 
     console.log('\n🔔 监听到 AssetLocked 事件:', {
         sender,
         receiver,
-        lockedAmount: ethers.formatEther(originalAmount),
-        fee: ethers.formatEther(feeAmount),
-        mintAmount: ethers.formatEther(mintAmount),
+        lockedAmount: ethers.formatUnits(originalAmount, tokenType === 'USDC' ? 6 : 18),
+        fee: ethers.formatUnits(feeAmount, tokenType === 'USDC' ? 6 : 18),
+        mintAmount: ethers.formatUnits(mintAmount, 18),
         txHash
     });
 
@@ -776,7 +788,7 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
             }
             return;
         }
-        
+        console.log("数量",amount);
         const tx = await dynamicMintContract.mint(
             transactionId,  // txId (bytes32) - 使用 transactionId
             receiver,    // recipient (address)
@@ -856,9 +868,9 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
         console.log('🎉 铸币成功:', {
             sender,
             receiver,
-            lockedAmount: ethers.formatEther(originalAmount),
-            mintedAmount: ethers.formatEther(mintAmount),
-            fee: ethers.formatEther(feeAmount),
+            lockedAmount: ethers.formatUnits(originalAmount, tokenType === 'USDC' ? 6 : 18),
+            mintedAmount: ethers.formatUnits(mintAmount, 18),
+            fee: ethers.formatUnits(feeAmount, tokenType === 'USDC' ? 6 : 18),
             sourceFromTxHash: txHash,
             targetToTxHash: tx.hash
         });
