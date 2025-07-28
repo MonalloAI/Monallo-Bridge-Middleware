@@ -277,8 +277,8 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             console.log(`🔄 检测到锚定代币 ${originalTokenAddress}，解锁时映射为原生代币 ${tokenAddress}`);
         }
 
-        // 创建跨链记录，确保所有必填字段都有值
-        const crossBridgeRecord = new CrossBridgeRecord({
+        // 准备跨链记录数据，但不立即保存
+        const crossBridgeData = {
             transactionId: transactionId.toString(),
             sourceChainId: 233, // IMUA 链ID
             sourceChain: 'imua',
@@ -305,10 +305,9 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             targetToTxStatus: 'pending',
 
             crossBridgeStatus: 'pending',
-        });
+        };
         
-        await crossBridgeRecord.save();
-        console.log(`✅ 已保存跨链记录到数据库`);
+        console.log(`📋 准备处理跨链记录，暂不保存到数据库`);
         
         // 执行解锁操作
         try {
@@ -445,7 +444,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                 recipientAddress,
                 unlockAmount,
                 signature,
-                { gasLimit: 500000 } // 设置足够的 gas 限制
+                { gasLimit: 500000 } 
             );
             
             console.log(`📤 解锁交易已发送 - 哈希: ${unlockTx.hash}`);
@@ -454,32 +453,55 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             const receipt = await unlockTx.wait();
             console.log(`✅ 解锁交易已确认 - 区块: ${receipt.blockNumber}`);
             
-            // === 新增重试机制 ===
-            const maxRetry = 3;
-            let retry = 0;
-            let updated = false;
-            while (retry < maxRetry && !updated) {
-                await new Promise(res => setTimeout(res, 2000));
-                const record = await CrossBridgeRecord.findOne({ transactionId: transactionId.toString() });
-                if (record) {
-                    await CrossBridgeRecord.updateOne(
-                        { transactionId: transactionId.toString() },
-                        { 
-                            crossBridgeStatus: 'minted',
-                            targetToTxHash: unlockTx.hash,
-                            targetToTxStatus: 'success',
-                            updatedAt: new Date()
-                        }
-                    );
-                    console.log(`✅ 第${retry + 1}次重试后，成功更新跨链记录状态`);
-                    updated = true;
-                } else {
-                    console.log(`⏳ 第${retry + 1}次重试，仍未查到记录，transactionId: ${transactionId.toString()}`);
-                    retry++;
-                }
-            }
-            if (!updated) {
-                console.warn('⚠️ 多次重试后仍未查到记录，未能更新状态:', transactionId.toString());
+            // 解锁成功后，保存完整的跨链记录
+            const finalCrossBridgeData = {
+                ...crossBridgeData,
+                crossBridgeStatus: 'success',
+                targetToTxHash: unlockTx.hash,
+                targetToTxStatus: 'success',
+            };
+            
+            const crossBridgeRecord = new CrossBridgeRecord(finalCrossBridgeData);
+            await crossBridgeRecord.save();
+            console.log(`✅ 解锁成功后，已保存完整的跨链记录到数据库`);
+            
+            // 查找并处理重复记录
+            // 1. 查找基于 sourceFromTxHash 的重复记录
+            const existingRecordByHash = await CrossBridgeRecord.findOne({ 
+                sourceFromTxHash: txHash,
+                _id: { $ne: crossBridgeRecord._id }
+            });
+            
+            // 2. 查找基于 pending 状态的重复记录
+            const existingPendingRecord = await CrossBridgeRecord.findOne({ 
+                sourceFromAddress: user,
+                targetChainId: sourceChainIdNum,
+                targetToAddress: recipientAddress,
+                crossBridgeStatus: 'pending',
+                _id: { $ne: crossBridgeRecord._id }
+            });
+            
+            // 优先使用基于哈希的记录，如果没有则使用 pending 记录
+            const existingRecord = existingRecordByHash || existingPendingRecord;
+            
+            if (existingRecord) {
+                console.log(`📋 找到原记录，准备复制数值字段...`);
+                
+                // 更新新记录，复制原记录的数值字段
+                await CrossBridgeRecord.updateOne(
+                    { _id: crossBridgeRecord._id },
+                    {
+                        sourceFromAmount: existingRecord.sourceFromAmount,
+                        sourceFromRealAmount: existingRecord.sourceFromRealAmount,
+                        targetToReceiveAmount: existingRecord.targetToReceiveAmount
+                    }
+                );
+                
+                console.log(`✅ 已复制原记录的数值字段到新记录`);
+                
+                // 删除原记录
+                await CrossBridgeRecord.deleteOne({ _id: existingRecord._id });
+                console.log(`🗑️ 已删除原记录 (ID: ${existingRecord._id})`);
             }
             
             // 发送 WebSocket 通知
@@ -496,15 +518,55 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         } catch (unlockError: any) {
             console.error(`❌ 解锁操作失败:`, unlockError);
             
-            // 更新记录状态为失败
-            await CrossBridgeRecord.updateOne(
-                { transactionId: transactionId.toString() },
-                { 
-                    crossBridgeStatus: 'failed',
-                    targetToTxStatus: 'failed',
-                    updatedAt: new Date()
-                }
-            );
+            // 解锁失败时，保存失败状态的跨链记录
+            const failedCrossBridgeData = {
+                ...crossBridgeData,
+                crossBridgeStatus: 'failed',
+                targetToTxStatus: 'failed',
+            };
+            
+            const crossBridgeRecord = new CrossBridgeRecord(failedCrossBridgeData);
+            await crossBridgeRecord.save();
+            console.log(`❌ 解锁失败，已保存失败状态的跨链记录到数据库`);
+            
+            // 查找并处理重复记录
+            // 1. 查找基于 sourceFromTxHash 的重复记录
+            const existingRecordByHash = await CrossBridgeRecord.findOne({ 
+                sourceFromTxHash: txHash,
+                _id: { $ne: crossBridgeRecord._id }
+            });
+            
+            // 2. 查找基于 pending 状态的重复记录
+            const existingPendingRecord = await CrossBridgeRecord.findOne({ 
+                sourceFromAddress: user,
+                targetChainId: sourceChainIdNum,
+                targetToAddress: recipientAddress,
+                crossBridgeStatus: 'pending',
+                _id: { $ne: crossBridgeRecord._id }
+            });
+            
+            // 优先使用基于哈希的记录，如果没有则使用 pending 记录
+            const existingRecord = existingRecordByHash || existingPendingRecord;
+            
+            if (existingRecord) {
+                console.log(`📋 找到原记录，准备复制数值字段...`);
+                
+                // 更新新记录，复制原记录的数值字段
+                await CrossBridgeRecord.updateOne(
+                    { _id: crossBridgeRecord._id },
+                    {
+                        sourceFromAmount: existingRecord.sourceFromAmount,
+                        sourceFromRealAmount: existingRecord.sourceFromRealAmount,
+                        targetToReceiveAmount: existingRecord.targetToReceiveAmount
+                    }
+                );
+                
+                console.log(`✅ 已复制原记录的数值字段到新记录`);
+                
+                // 删除原记录
+                await CrossBridgeRecord.deleteOne({ _id: existingRecord._id });
+                console.log(`🗑️ 已删除原记录 (ID: ${existingRecord._id})`);
+            }
             
             // 发送 WebSocket 通知
             sendToUser(recipientAddress, {
