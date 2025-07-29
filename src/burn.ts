@@ -9,6 +9,7 @@ import { sendToUser } from './WebSocket/websocket';
 import { QueueChecker } from './utils/queueChecker';
 import * as fs from 'fs';
 import * as path from 'path';
+import { JsonRpcProvider } from 'ethers';
 
 dotenv.config();
 
@@ -37,7 +38,7 @@ function createWssProvider(url: string): ethers.Provider {
 // 创建提供者
 const imuaProvider = createWssProvider(IMUA_RPC_URL); 
 const sepoliaProvider = createWssProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
-const platonProvider = createWssProvider(PLATON_RPC_URL);
+const platonProvider = new JsonRpcProvider(PLATON_RPC_URL);
 
 // 创建钱包
 const wallet = new ethers.Wallet(PRIVATE_KEY!);
@@ -142,7 +143,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         // 1. 获取 deployedAddresses
         const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi/deployed_addresses.json'), 'utf8'));
         // 2. 反查币种类型和 maoKey
-        function findBurnedTokenTypeAndMaoKey(burnedAddress: string) {
+        const findBurnedTokenTypeAndMaoKey = (burnedAddress: string) => {
             const imuaTokens = deployedAddresses.TOKEN_CONTRACTS['Imua-Testnet'];
             for (const [maoKey, value] of Object.entries(imuaTokens)) {
                 if (typeof value === 'string') {
@@ -158,9 +159,9 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                 }
             }
             return null;
-        }
+        };
         // 3. 获取目标链币种合约地址
-        function getTargetTokenAddress(tokenType: string, targetChainName: string) {
+        const getTargetTokenAddress = (tokenType: string, targetChainName: string) => {
             // 原生币
             const nativeMap = {
                 'ETH': '0x0000000000000000000000000000000000000000',
@@ -177,7 +178,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
             // 再查锚定币名
             if (tokenContracts['mao' + tokenType]) return tokenContracts['mao' + tokenType];
             return null;
-        }
+        };
         // 4. 反查币种类型
         const burnedTokenInfo = findBurnedTokenTypeAndMaoKey(event.log.address);
         if (!burnedTokenInfo) {
@@ -205,7 +206,12 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         let unlockAmount = amount;
         const decimals6 = ['USDC', 'maoUSDC'];
         if (decimals6.includes(burnedTokenInfo.type.toUpperCase())) {
-            unlockAmount = amount * BigInt(10 ** 12);
+            // amount是18位小数格式，但USDC是6位小数
+            // 需要将18位小数转换为6位小数格式
+            // 方法：先转换为人类可读格式，再转换为6位小数格式
+            const humanReadableAmount = ethers.formatUnits(amount, 18);
+            unlockAmount = ethers.parseUnits(humanReadableAmount, 6);
+            console.log(`🔢 USDC金额转换: 原始金额 ${humanReadableAmount} -> 解锁金额 ${ethers.formatUnits(unlockAmount, 6)} USDC`);
         }
 
         // 确保所有必要的参数都存在
@@ -376,8 +382,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                         [
                             'function balanceOf(address account) view returns (uint256)',
                             'function symbol() view returns (string)',
-                            'function decimals() view returns (uint8)',
-                            'function allowance(address owner, address spender) view returns (uint256)'
+                            'function decimals() view returns (uint8)'
                         ],
                         unlockProvider
                     );
@@ -388,24 +393,8 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
                     
                     console.log(`💰 合约 ${symbol} 代币余额: ${ethers.formatUnits(contractBalance, decimals)} ${symbol}`);
                     
-                    // 检查代币是否已经授权给合约
-                    try {
-                        // 检查钱包对合约的授权
-                        // 使用对应链的钱包地址
-                        const walletAddress = sourceChainIdNum === 11155111 ? 
-                            await sepoliaWallet.getAddress() : 
-                            await platonWallet.getAddress();
-                        const allowance = await tokenContract.allowance(walletAddress, unlockContract.target);
-                        console.log(`🔑 钱包对合约的授权额度: ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
-                        
-                        if (allowance < unlockAmount) {
-                            console.error(`❌ 授权额度不足! 需要 ${ethers.formatUnits(unlockAmount, decimals)} ${symbol}，但只授权了 ${ethers.formatUnits(allowance, decimals)} ${symbol}`);
-                            console.log('💡 请确保已经授权足够的代币给合约');
-                            return;
-                        }
-                    } catch (allowanceError) {
-                        console.error('❌ 检查授权额度时出错:', allowanceError);
-                    }
+                    // 跳过授权检查，直接进行解锁操作
+                    console.log(`🔓 跳过授权检查，直接进行解锁操作`);
                 }
                 
                 // 检查余额是否足够

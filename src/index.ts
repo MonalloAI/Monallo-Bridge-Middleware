@@ -9,6 +9,7 @@ import ws from 'ws';
 import { QueueChecker } from './utils/queueChecker';
 import * as fs from 'fs';
 import * as path from 'path';
+import { JsonRpcProvider } from 'ethers';
 
 
 dotenv.config();
@@ -30,7 +31,7 @@ const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi
 
 // 创建提供者
 const sepoliaProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
-const platonProvider = new ethers.WebSocketProvider(PLATON_RPC_URL!);
+const platonProvider = new ethers.JsonRpcProvider(PLATON_RPC_URL);
 
 // 为 IMUA 网络创建提供者，使用自定义网络配置
 const imuaNetwork = {
@@ -117,13 +118,114 @@ export async function startListening() {
             console.error('❌ 全局定期队列检查失败:', error);
         }
     }, 30 * 60 * 1000); // 30分钟
+    
+    // 定期检查WebSocket连接状态（每5分钟检查一次）
+    setInterval(async () => {
+        try {
+            console.log('🔍 检查WebSocket连接状态...');
+            
+            // 检查各个网络的连接状态
+            const networks = [
+                { name: 'Ethereum-Sepolia', provider: sepoliaProvider, contract: sepoliaLockContract },
+                { name: 'PlatON-Mainnet', provider: platonProvider, contract: platonLockContract },
+                { name: 'Imua-Testnet', provider: imuaProvider, contract: imuaLockContract },
+                { name: 'ZetaChain-Testnet', provider: imuaProvider, contract: zetaChainLockContract }
+            ];
+            
+            for (const network of networks) {
+                if (network.provider instanceof ethers.WebSocketProvider) {
+                    const socket = network.provider.websocket as ws.WebSocket;
+                    const status = socket?.readyState;
+                    const statusText = status === ws.OPEN ? 'OPEN' : 
+                                     status === ws.CONNECTING ? 'CONNECTING' : 
+                                     status === ws.CLOSING ? 'CLOSING' : 
+                                     status === ws.CLOSED ? 'CLOSED' : 'UNKNOWN';
+                    
+                    console.log(`📡 ${network.name} WebSocket 状态: ${statusText} (${status})`);
+                    
+                    // 如果连接断开，尝试重新连接
+                    if (status === ws.CLOSED) {
+                        console.log(`🔄 ${network.name} 连接已断开，尝试重新连接...`);
+                        listenToContract(network.contract, network.provider, queueChecker, network.name);
+                    }
+                } else {
+                    console.log(`📡 ${network.name} HTTP 连接状态: 正常`);
+                }
+            }
+            
+        } catch (error) {
+            console.error('❌ WebSocket连接状态检查失败:', error);
+        }
+    }, 5 * 60 * 1000); // 5分钟
 }
 
-async function listenToContract(lockContract: ethers.Contract, provider: ethers.WebSocketProvider, queueChecker: QueueChecker, networkName: string) {
+async function listenToContract(lockContract: ethers.Contract, provider: ethers.Provider, queueChecker: QueueChecker, networkName: string) {
     console.log(`✅ 开始监听 ${networkName} 网络上的 LockTokens 合约地址: ${lockContract.target}`);
     
-    const socket = provider.websocket as ws.WebSocket;
+    // 检查合约地址是否有效
+    if (!lockContract.target || lockContract.target === '0x0000000000000000000000000000000000000000') {
+        console.error(`❌ ${networkName} 合约地址无效: ${lockContract.target}`);
+        return;
+    }
+    
+    // 检查合约代码是否存在
+    try {
+        const contractCode = await provider.getCode(lockContract.target);
+        if (contractCode === '0x') {
+            console.error(`❌ ${networkName} 合约地址没有代码，可能合约未部署: ${lockContract.target}`);
+            return;
+        }
+        console.log(`✅ ${networkName} 合约代码检查通过，代码长度: ${contractCode.length}`);
+    } catch (error) {
+        console.error(`❌ ${networkName} 检查合约代码失败:`, error);
+        return;
+    }
+    
+        // 检查连接状态（区分WebSocket和HTTP提供者）
+    if (provider instanceof ethers.WebSocketProvider) {
+        const socket = provider.websocket as ws.WebSocket;
+        if (!socket || socket.readyState !== ws.OPEN) {
+            console.error(`❌ ${networkName} WebSocket 连接未建立或未就绪，状态: ${socket?.readyState}`);
+            return;
+        }
+        
+        console.log(`✅ ${networkName} WebSocket 连接状态正常，开始监听事件...`);
+        
+        // 添加WebSocket连接状态监听
+        socket.on('open', () => {
+            console.log(`✅ ${networkName} WebSocket 连接已建立`);
+        });
 
+        socket.on('error', (err: any) => {
+            console.error(`❌ ${networkName} WebSocket 连接错误:`, err);
+        });
+
+        socket.on('close', (code: number, reason: Buffer) => {
+            console.warn(`⚠️ ${networkName} WebSocket 连接关闭，code: ${code}, reason: ${reason?.toString()}`);
+        });
+    } else {
+        console.log(`✅ ${networkName} HTTP 连接正常，开始监听事件...`);
+    }
+
+    // 测试合约连接和事件监听
+    try {
+        console.log(`🧪 测试 ${networkName} 合约连接...`);
+        
+        // 测试读取合约基本信息
+        const contractName = await lockContract.name();
+        const contractSymbol = await lockContract.symbol();
+        console.log(`✅ ${networkName} 合约连接测试成功: ${contractName} (${contractSymbol})`);
+        
+        // 测试事件过滤器
+        const filter = lockContract.filters.AssetLocked();
+        console.log(`✅ ${networkName} 事件过滤器创建成功:`, filter);
+        
+    } catch (error: any) {
+        console.error(`❌ ${networkName} 合约连接测试失败:`, error.message);
+        console.log(`💡 这可能是正常的，如果合约没有 name/symbol 方法`);
+    }
+
+    // 监听合约事件
     lockContract.on('AssetLocked', async (transactionId, user, destinationChainId, recipientAddress, tokenAddress, amount, fee, event) => {
         console.log(`🔔 监听到 ${networkName} 网络上的 AssetLocked 事件:`);
         
@@ -889,54 +991,60 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
 });
 
 
-socket.on('error', (err: any) => {
-    console.error('❌ A链 WebSocket 错误:', err);
-});
+    // 只有WebSocket提供者才需要监听连接状态
+    if (provider instanceof ethers.WebSocketProvider) {
+        const socket = provider.websocket as ws.WebSocket;
+        
+        socket.on('error', (err: any) => {
+            console.error(`❌ ${networkName} WebSocket 错误:`, err);
+        });
 
-socket.on('close', async (code: number) => {
-    console.warn(`⚠️ ${networkName} WebSocket 连接关闭，code: ${code}，尝试重连...`);
-    
-    // 断线重连后重新检查队列
-    try {
-        await queueChecker.checkPendingQueue();
-        console.log(`✅ ${networkName} 断线重连后队列检查完成`);
-    } catch (error) {
-        console.error(`❌ ${networkName} 断线重连后队列检查失败:`, error);
-    }
-    
-    // 重新连接特定网络的WebSocket
-    setTimeout(() => {
-        try {
-            // 重新创建provider
-            let newProvider;
-            if (networkName === 'Ethereum-Sepolia') {
-                newProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
-            } else if (networkName === 'PlatON-Mainnet') {
-                newProvider = new ethers.WebSocketProvider(PLATON_RPC_URL!);
-            } else if (networkName === 'Imua-Testnet') {
-                newProvider = new ethers.WebSocketProvider(IMUA_RPC_URL!, imuaNetwork);
-            } else if (networkName === 'ZetaChain-Testnet') {
-                newProvider = new ethers.WebSocketProvider(IMUA_RPC_URL!, imuaNetwork);
-            } else {
-                return; // 未知网络，不重连
+        socket.on('close', async (code: number) => {
+            console.warn(`⚠️ ${networkName} WebSocket 连接关闭，code: ${code}，尝试重连...`);
+            
+            // 断线重连后重新检查队列
+            try {
+                await queueChecker.checkPendingQueue();
+                console.log(`✅ ${networkName} 断线重连后队列检查完成`);
+            } catch (error) {
+                console.error(`❌ ${networkName} 断线重连后队列检查失败:`, error);
             }
             
-            // 重新监听该网络的合约
-            listenToContract(
-                new ethers.Contract(lockContract.target as string, LockTokensAbi.abi, newProvider),
-                newProvider,
-                queueChecker,
-                networkName
-            );
-            
-            console.log(`✅ ${networkName} 网络重新连接成功`);
-        } catch (error) {
-            console.error(`❌ ${networkName} 网络重连失败:`, error);
-            // 继续尝试重连
-            setTimeout(() => listenToContract(lockContract, provider, queueChecker, networkName), 5000);
-        }
-    }, 3000);
-});
+            // 重新连接特定网络的WebSocket
+            setTimeout(() => {
+                try {
+                    // 重新创建provider
+                    let newProvider;
+                    if (networkName === 'Ethereum-Sepolia') {
+                        newProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
+                    } else if (networkName === 'PlatON-Mainnet') {
+                        newProvider = new ethers.JsonRpcProvider(PLATON_RPC_URL!); // PlatON使用HTTP
+                    } else if (networkName === 'Imua-Testnet') {
+                        newProvider = new ethers.WebSocketProvider(IMUA_RPC_URL!, imuaNetwork);
+                    } else if (networkName === 'ZetaChain-Testnet') {
+                        newProvider = new ethers.WebSocketProvider(IMUA_RPC_URL!, imuaNetwork);
+                    } else {
+                        return; // 未知网络，不重连
+                    }
+                    
+                    // 重新监听该网络的合约
+                    listenToContract(
+                        new ethers.Contract(lockContract.target as string, LockTokensAbi.abi, newProvider),
+                        newProvider,
+                        queueChecker,
+                        networkName
+                    );
+                    
+                    console.log(`✅ ${networkName} 网络重新连接成功`);
+                } catch (error) {
+                    console.error(`❌ ${networkName} 网络重连失败:`, error);
+                    // 继续尝试重连
+                    setTimeout(() => listenToContract(lockContract, provider, queueChecker, networkName), 5000);
+                }
+            }, 3000);
+        });
+    }
     
 // 各网络不再单独定期检查队列，由全局定时器统一处理
 }
+ 

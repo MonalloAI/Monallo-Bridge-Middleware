@@ -37,7 +37,7 @@ const CrossBridgeRecordSchema = new Schema<ICrossBridgeRecord>(
 
     crossBridgeStatus: {
       type: String,
-      enum: ['pending', 'failed', 'minted'],
+      enum: ['pending', 'failed', 'minted', 'success'],
       default: 'pending',
     },
   },
