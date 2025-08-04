@@ -287,7 +287,7 @@ async function handleBurnedEvent(event: any, contractKey: string, queueChecker: 
         const crossBridgeData = {
             transactionId: transactionId.toString(),
             sourceChainId: 233, // IMUA 链ID
-            sourceChain: 'imua',
+            sourceChain: 'Imua-Testnet',
             sourceRpc: IMUA_RPC_URL,
             sourceFromAddress: user,
             sourceFromTokenName: contractKey.split('_').pop() || 'unknown', // 从合约键名中提取代币名称
