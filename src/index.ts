@@ -31,6 +31,7 @@ const deployedAddresses = JSON.parse(fs.readFileSync(path.join(__dirname, './abi
 
 // 创建提供者
 const sepoliaProvider = new ethers.WebSocketProvider(`${ETH_RPC_URL}${ETH_API_KEY}`);
+// PlatON 使用 HTTP 提供者，因为 WebSocket 可能不支持
 const platonProvider = new ethers.JsonRpcProvider(PLATON_RPC_URL);
 
 // 为 IMUA 网络创建提供者，使用自定义网络配置
@@ -211,10 +212,18 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
     try {
         console.log(`🧪 测试 ${networkName} 合约连接...`);
         
-        // 测试读取合约基本信息
-        const contractName = await lockContract.name();
-        const contractSymbol = await lockContract.symbol();
-        console.log(`✅ ${networkName} 合约连接测试成功: ${contractName} (${contractSymbol})`);
+        // 检查合约是否有 name 和 symbol 方法
+        const hasName = lockContract.interface.hasFunction('name');
+        const hasSymbol = lockContract.interface.hasFunction('symbol');
+        
+        if (hasName && hasSymbol) {
+            // 测试读取合约基本信息
+            const contractName = await lockContract.name();
+            const contractSymbol = await lockContract.symbol();
+            console.log(`✅ ${networkName} 合约连接测试成功: ${contractName} (${contractSymbol})`);
+        } else {
+            console.log(`✅ ${networkName} 合约连接测试成功: 合约没有 name/symbol 方法，这是正常的`);
+        }
         
         // 测试事件过滤器
         const filter = lockContract.filters.AssetLocked();
@@ -567,12 +576,8 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
     
     let mintContractProvider;
     if (destinationChainId.toString() === '233') {
-        const imuaNetworkConfig = {
-            chainId: 233,
-            name: 'imua'
-        };
-        const imuaProviderForContract = new ethers.WebSocketProvider(IMUA_RPC_URL!, imuaNetworkConfig);
-        mintContractProvider = new ethers.Wallet(PRIVATE_KEY!, imuaProviderForContract);
+        // 直接使用已存在的 imuaWallet，避免创建新的提供者
+        mintContractProvider = imuaWallet;
     } else {
         mintContractProvider = imuaWallet;
     }
@@ -777,14 +782,16 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
         }
         
         // 检查交易是否已经处理过
-        const isProcessed = await dynamicMintContract.processedMintTxs(txHash);
+        // 注意：processedMintTxs 检查的是 transactionId，不是 txHash
+        const isProcessed = await dynamicMintContract.processedMintTxs(transactionId);
         console.log('🔍 交易处理状态:', {
+            transactionId,
             txHash,
             isProcessed
         });
         
         if (isProcessed) {
-            console.log('⏭️ 交易已处理，跳过:', txHash);
+            console.log('⏭️ 交易已处理，跳过:', transactionId);
             return;
         }
         
@@ -890,7 +897,17 @@ async function listenToContract(lockContract: ethers.Contract, provider: ethers.
             }
             return;
         }
-        console.log("数量",amount);
+        console.log("数量", mintAmount);
+        
+        // 添加调试信息
+        console.log('🔍 Mint 函数调用参数:', {
+            transactionId,
+            receiver,
+            mintAmount: mintAmount.toString(),
+            signature: signature.slice(0, 20) + '...',
+            gasEstimate: gasEstimate.toString()
+        });
+        
         const tx = await dynamicMintContract.mint(
             transactionId,  // txId (bytes32) - 使用 transactionId
             receiver,    // recipient (address)
